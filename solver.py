@@ -4,34 +4,40 @@
 # dependencies = ["watchdog>=4.0", "anthropic>=0.69"]
 # ///
 """
-Watch a folder for new screenshots and solve the coding problem in each one
-with the Claude API (vision). Pairs with screenshot_hotkey.py: hotkey captures
-a problem to ~/Screenshots, this watcher solves it.
+Watch a folder for new screenshot BATCHES and solve the coding problem in each
+with the Claude API (vision). Pairs with screenshot_hotkey.py: the trigger key
+captures one-or-more pages into batch_<ts>/, and this watcher solves the whole
+batch as a single multi-image request.
 
-Flow per new image:
-  1. detect a new .png/.jpg dropped into the watched folder
-  2. wait for the file to finish writing (size settles)
-  3. send it to Claude (claude-opus-4-8, vision, streaming, adaptive thinking)
-  4. stream the solution code to the terminal, and post a macOS notification
+The batch contract (see BATCH_CONTRACT.md):
+  batch_<ts>/
+    page-01.png, page-02.png, ...   ordered pages (main display)
+    manifest.json                   written LAST, atomically — the "done" signal
 
-The answer is plain, readable code printed to the terminal — favoring clarity a
-new programmer could follow over clever one-liners. Nothing is written to disk.
+Flow per batch:
+  1. detect a new manifest.json (recursive watch)
+  2. read its `pages` in order
+  3. send them as ordered image blocks in ONE Claude request (streaming)
+  4. stream the solution to the terminal, post a macOS notification, and drop a
+     `.solved` marker in the batch dir so a restart won't re-solve it
 
 Defaults (override with env vars):
   SOLVER_DIR        folder to watch         (default: $SHOT_DIR or ~/Screenshots)
   SOLVER_MODEL      Claude model id         (default: claude-opus-4-8)
   SOLVER_LANG       preferred answer lang   (default: infer from screenshot)
-  SOLVER_SETTLE     secs file must be idle  (default: 1.0)
-  SOLVER_BACKLOG    solve files already     (default: 0 — only new files)
+  SOLVER_BACKLOG    solve batches already   (default: 0 — only new ones)
                     present at startup
   SOLVER_THINKING   stream reasoning too    (default: 0)
   SOLVER_NOTIFY     macOS notification      (default: 1)
+  SOLVER_SETTLE     secs a loose image must be idle before reading, for the
+                    one-shot single-image mode only          (default: 1.0)
 
 Auth: ANTHROPIC_API_KEY in the environment, or an `ant auth login` profile —
 the SDK resolves either. No key in code.
 """
 
 import base64
+import json
 import os
 import queue
 import subprocess
@@ -39,6 +45,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 
 import anthropic
 from watchdog.events import FileSystemEventHandler
@@ -54,6 +61,9 @@ BACKLOG = os.environ.get("SOLVER_BACKLOG", "0") == "1"
 SHOW_THINKING = os.environ.get("SOLVER_THINKING", "0") == "1"
 NOTIFY = os.environ.get("SOLVER_NOTIFY", "1") == "1"
 
+MANIFEST = "manifest.json"
+SOLVED_MARKER = ".solved"
+
 IMAGE_TYPES = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -67,10 +77,11 @@ IMAGE_TYPES = {
 NO_PROBLEM = "NO_PROBLEM"
 
 SYSTEM = (
-    "You are shown a screenshot that should contain a coding or algorithm "
-    "problem (a LeetCode-style prompt, an interview question, a failing test, a "
-    "code snippet with a bug, etc.). Solve it and output the solution as source "
-    "code that will be printed straight to a terminal.\n\n"
+    "You are shown one or more screenshots that are sequential pages of a SINGLE "
+    "coding or algorithm problem (a LeetCode-style prompt, an interview question, "
+    "a failing test, a code snippet with a bug, etc.). Read all pages together as "
+    "one problem and solve it, outputting the solution as source code that will be "
+    "printed straight to a terminal.\n\n"
     "Output rules:\n"
     "- Output ONLY the code. No Markdown, no ``` code fences, no prose before "
     "or after it.\n"
@@ -86,15 +97,16 @@ SYSTEM = (
     "- Make it complete and runnable.\n"
     "- Pick the language the screenshot calls for; if none is specified"
     + (f", default to {LANG}.\n\n" if LANG else ", default to Python.\n\n")
-    + "If the screenshot does NOT contain a solvable code problem (it's a blank "
-    f"screen, a desktop, unrelated content), reply with exactly {NO_PROBLEM} and "
-    "nothing else."
+    + "If the screenshots do NOT contain a solvable code problem (a blank screen, "
+    f"a desktop, unrelated content), reply with exactly {NO_PROBLEM} and nothing "
+    "else."
 )
 
 
 def wait_until_settled(path: Path, idle: float, timeout: float = 30.0) -> bool:
-    """Block until path's size stops changing for `idle` seconds. screencapture
-    and downloads write incrementally; reading mid-write yields a corrupt image."""
+    """Block until path's size stops changing for `idle` seconds. Used for the
+    one-shot single-image mode (a batch's pages are already complete when its
+    manifest appears, so the watcher path doesn't need this)."""
     deadline = time.monotonic() + timeout
     last = -1
     stable_since = None
@@ -131,17 +143,20 @@ def notify(title: str, message: str) -> None:
         pass
 
 
-def solve(path: Path, client: anthropic.Anthropic) -> None:
+def image_block(path: Path) -> Optional[dict]:
     media_type = IMAGE_TYPES.get(path.suffix.lower())
-    if media_type is None:
-        return
-
-    if not wait_until_settled(path, SETTLE):
-        print(f"  ! {path.name}: never settled, skipping", file=sys.stderr, flush=True)
-        return
-
+    if media_type is None or not path.exists():
+        return None
     data = base64.standard_b64encode(path.read_bytes()).decode("utf-8")
-    print(f"\n=== solving {path.name} ===", flush=True)
+    return {
+        "type": "image",
+        "source": {"type": "base64", "media_type": media_type, "data": data},
+    }
+
+
+def stream_solution(content: list, client: anthropic.Anthropic, label: str) -> None:
+    """Send one request with the given content blocks and stream the answer."""
+    print(f"\n=== solving {label} ===", flush=True)
 
     thinking = {"type": "adaptive"}
     if SHOW_THINKING:
@@ -155,22 +170,7 @@ def solve(path: Path, client: anthropic.Anthropic) -> None:
             thinking=thinking,
             output_config={"effort": "high"},
             system=SYSTEM,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": data,
-                            },
-                        },
-                        {"type": "text", "text": "Solve the problem in this screenshot."},
-                    ],
-                }
-            ],
+            messages=[{"role": "user", "content": content}],
         ) as stream:
             for event in stream:
                 if event.type == "content_block_delta":
@@ -195,20 +195,75 @@ def solve(path: Path, client: anthropic.Anthropic) -> None:
     answer = "".join(parts).strip()
 
     if final.stop_reason == "refusal":
-        print(f"  ! {path.name}: refused", file=sys.stderr, flush=True)
+        print(f"  ! {label}: refused", file=sys.stderr, flush=True)
         return
     if answer == NO_PROBLEM or not answer:
-        print(f"  (no code problem in {path.name})", flush=True)
+        print(f"  (no code problem in {label})", flush=True)
         return
 
-    notify("Solver", f"Solved {path.name}")
+    notify("Solver", f"Solved {label}")
+
+
+def read_manifest(manifest_path: Path) -> Optional[dict]:
+    """Read a manifest, tolerating a brief window where the rename is mid-flight."""
+    for _ in range(5):
+        try:
+            return json.loads(manifest_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            time.sleep(0.1)
+    return None
+
+
+def solve_batch(manifest_path: Path, client: anthropic.Anthropic) -> None:
+    batch_dir = manifest_path.parent
+    marker = batch_dir / SOLVED_MARKER
+    if marker.exists():
+        return  # already solved (restart / duplicate event)
+
+    manifest = read_manifest(manifest_path)
+    if manifest is None:
+        print(f"  ! {batch_dir.name}: unreadable manifest, skipping", file=sys.stderr, flush=True)
+        return
+
+    pages = manifest.get("pages") or sorted(
+        p.name for p in batch_dir.glob("page-*.png")
+    )
+    blocks = [b for b in (image_block(batch_dir / name) for name in pages) if b]
+    if not blocks:
+        print(f"  ! {batch_dir.name}: no readable pages, skipping", file=sys.stderr, flush=True)
+        return
+
+    content: list = [
+        {
+            "type": "text",
+            "text": (
+                f"The following {len(blocks)} image(s) are sequential pages of one "
+                "problem, in order. Read them together, then solve the problem."
+            ),
+        },
+        *blocks,
+    ]
+    stream_solution(content, client, f"{batch_dir.name} ({len(blocks)} page(s))")
+    marker.write_text("")  # idempotency: don't re-solve on restart
+
+
+def solve_image(path: Path, client: anthropic.Anthropic) -> None:
+    """One-shot: solve a single loose image (testing / `solve-one <img>`)."""
+    if not wait_until_settled(path, SETTLE):
+        print(f"  ! {path.name}: never settled, skipping", file=sys.stderr, flush=True)
+        return
+    block = image_block(path)
+    if block is None:
+        print(f"  ! {path.name}: not a readable image", file=sys.stderr, flush=True)
+        return
+    content = [block, {"type": "text", "text": "Solve the problem in this screenshot."}]
+    stream_solution(content, client, path.name)
 
 
 def daemonize() -> None:
     """Double-fork into a new session so a parent that tears down its process
-    group (e.g. rite's gosh interpreter) can't reap us. Redirect std streams to
-    the log file and record our own PID for `rite solve-stop`. Mirrors the
-    daemonize() in screenshot_hotkey.py.
+    group can't reap us. Redirect std streams to the log file and record our own
+    PID for `just solve-stop`. Mirrors the daemonize() in screenshot_hotkey.py.
     """
     pidfile = Path(os.environ.get("SOLVER_PIDFILE", ".solver.pid")).resolve()
     logfile = Path(os.environ.get("SOLVER_LOG", ".solver.log")).resolve()
@@ -230,15 +285,15 @@ def daemonize() -> None:
 
 
 class Handler(FileSystemEventHandler):
-    """Enqueue new image files; a worker thread solves them one at a time so
-    overlapping captures (e.g. one file per display) don't interleave output."""
+    """Enqueue a batch when its manifest.json appears. A worker solves batches
+    one at a time so concurrent batches don't interleave output."""
 
     def __init__(self, work: "queue.Queue[Path]") -> None:
         self.work = work
 
     def _maybe_enqueue(self, src: str) -> None:
         p = Path(src)
-        if p.suffix.lower() in IMAGE_TYPES:
+        if p.name == MANIFEST:
             self.work.put(p)
 
     def on_created(self, event) -> None:
@@ -246,7 +301,8 @@ class Handler(FileSystemEventHandler):
             self._maybe_enqueue(event.src_path)
 
     def on_moved(self, event) -> None:
-        # Some tools write to a temp name then rename into place.
+        # The listener writes manifest.json via temp + rename, which surfaces as
+        # a move to the final name.
         if not event.is_directory:
             self._maybe_enqueue(event.dest_path)
 
@@ -254,22 +310,22 @@ class Handler(FileSystemEventHandler):
 def worker(work: "queue.Queue[Path]", client: anthropic.Anthropic) -> None:
     seen: set[Path] = set()
     while True:
-        path = work.get()
+        manifest_path = work.get()
         try:
-            resolved = path.resolve()
-            if resolved in seen:
+            key = manifest_path.parent.resolve()
+            if key in seen:
                 continue
-            seen.add(resolved)
-            solve(path, client)
-        except Exception as e:  # one bad image shouldn't kill the watcher
-            print(f"  ! error on {path.name}: {e}", file=sys.stderr, flush=True)
+            seen.add(key)
+            solve_batch(manifest_path, client)
+        except Exception as e:  # one bad batch shouldn't kill the watcher
+            print(f"  ! error on {manifest_path.parent.name}: {e}", file=sys.stderr, flush=True)
         finally:
             work.task_done()
 
 
 def main() -> None:
     daemon = "--daemon" in sys.argv[1:]
-    files = [a for a in sys.argv[1:] if a != "--daemon"]
+    args = [a for a in sys.argv[1:] if a != "--daemon"]
 
     client = anthropic.Anthropic()
     # Preflight in the foreground (before any fork) so a missing key fails
@@ -287,11 +343,17 @@ def main() -> None:
         )
         sys.exit(1)
 
-    # One-shot mode: `solver.py <image>` solves that file and exits. Handy for
-    # testing the API path without running the watcher.
-    if files:
-        for arg in files:
-            solve(Path(arg).expanduser(), client)
+    # One-shot mode: `solver.py <arg>...` solves and exits. Each arg may be a
+    # batch dir, a manifest.json, or a single image — handy for testing.
+    if args:
+        for raw in args:
+            p = Path(raw).expanduser()
+            if p.is_dir():
+                solve_batch(p / MANIFEST if (p / MANIFEST).exists() else p, client)
+            elif p.name == MANIFEST:
+                solve_batch(p, client)
+            else:
+                solve_image(p, client)
         return
 
     if daemon:
@@ -303,18 +365,18 @@ def main() -> None:
     threading.Thread(target=worker, args=(work, client), daemon=True).start()
 
     if BACKLOG:
-        for p in sorted(WATCH_DIR.iterdir()):
-            if p.is_file() and p.suffix.lower() in IMAGE_TYPES:
-                work.put(p)
+        for m in sorted(WATCH_DIR.glob(f"**/{MANIFEST}")):
+            if not (m.parent / SOLVED_MARKER).exists():
+                work.put(m)
 
     observer = Observer()
-    observer.schedule(Handler(work), str(WATCH_DIR), recursive=False)
+    observer.schedule(Handler(work), str(WATCH_DIR), recursive=True)
     observer.start()
 
     print(
-        f"Watching {WATCH_DIR} for new screenshots\n"
+        f"Watching {WATCH_DIR} for new batches\n"
         f"  model:   {MODEL}\n"
-        f"  backlog: {'yes' if BACKLOG else 'no (new files only)'}\n"
+        f"  backlog: {'yes' if BACKLOG else 'no (new batches only)'}\n"
         "Press Ctrl-C to stop.",
         flush=True,
     )

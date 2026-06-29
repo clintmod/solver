@@ -14,20 +14,35 @@
 
 set positional-arguments
 
+# Resolve the mise binary once (PATH, else the standard install location the
+# `mise.run` installer uses). Tools are always invoked as `{{mise}} exec -- ...`
+# so they work WITHOUT mise shell-activation — bare `uv` only resolves via mise
+# shims, which require activation and is exactly why a fresh machine reports
+# "uv not installed".
+mise := `command -v mise 2>/dev/null || echo "$HOME/.local/bin/mise"`
+
 # List tasks
 default:
     @just --list
 
-# Install the pinned toolchain (uv, just) via mise — idempotent.
+# Install mise (if missing) + the pinned toolchain (uv, just) — idempotent.
+# Every uv-using recipe depends on this, so a cold machine self-bootstraps.
 setup:
-    mise trust
-    mise install
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v mise >/dev/null 2>&1 && [ ! -x "$HOME/.local/bin/mise" ]; then
+        echo "mise not found — installing from https://mise.run ..."
+        curl -fsSL https://mise.run | sh
+    fi
+    "{{mise}}" trust
+    "{{mise}}" install
+    echo "toolchain ready: $("{{mise}}" exec -- uv --version)"
 
 # --- capture: foreground ----------------------------------------------------
 
 # Run the listener in the foreground (Ctrl-C to stop).
-run:
-    uv run screenshot_hotkey.py
+run: setup
+    {{mise}} exec -- uv run screenshot_hotkey.py
 
 # Take a single full-screen capture now (verifies screencapture + folder).
 shot:
@@ -49,13 +64,13 @@ open:
 # permission from the terminal you launch it from.
 
 # Start the listener detached in the background.
-start:
+start: setup
     #!/usr/bin/env bash
     set -euo pipefail
     if [ -f .listener.pid ] && kill -0 "$(cat .listener.pid)" 2>/dev/null; then
         echo "already running (pid $(cat .listener.pid))"; exit 0
     fi
-    nohup uv run screenshot_hotkey.py >> .listener.log 2>&1 </dev/null &
+    nohup {{mise}} exec -- uv run screenshot_hotkey.py >> .listener.log 2>&1 </dev/null &
     echo $! > .listener.pid
     echo "started (pid $(cat .listener.pid)) -> logs: just logs"
 
@@ -84,21 +99,21 @@ logs:
 # --- solver (solver.py built in a separate session) -------------------------
 
 # Watch the screenshots folder and solve new captures (Ctrl-C to stop).
-solve:
-    uv run solver.py
+solve: setup
+    {{mise}} exec -- uv run solver.py
 
 # Solve a single image now, e.g.: just solve-one ~/Screenshots/foo.png
-solve-one *ARGS:
-    uv run solver.py "$@"
+solve-one *ARGS: setup
+    {{mise}} exec -- uv run solver.py "$@"
 
 # Start the solver watcher detached in the background.
-solve-start:
+solve-start: setup
     #!/usr/bin/env bash
     set -euo pipefail
     if [ -f .solver.pid ] && kill -0 "$(cat .solver.pid)" 2>/dev/null; then
         echo "already running (pid $(cat .solver.pid))"; exit 0
     fi
-    nohup uv run solver.py >> .solver.log 2>&1 </dev/null &
+    nohup {{mise}} exec -- uv run solver.py >> .solver.log 2>&1 </dev/null &
     echo $! > .solver.pid
     echo "started (pid $(cat .solver.pid)) -> logs: just solve-logs"
 
