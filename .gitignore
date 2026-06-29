@@ -1,0 +1,13 @@
+# detached-runner artifacts
+.listener.pid
+.listener.log
+.solver.pid
+.solver.log
+
+# default capture output (if SHOT_DIR points inside the repo)
+/Screenshots/
+/solutions/
+
+# python
+__pycache__/
+*.pyc

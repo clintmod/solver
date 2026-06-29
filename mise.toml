@@ -1,0 +1,6 @@
+[tools]
+# uv runs the Python scripts and resolves their inline-metadata deps
+# (pynput for the listener; watchdog + anthropic for the solver).
+uv = "0.10.0"
+# just is the task runner that drives the Justfile.
+just = "1.46.0"
