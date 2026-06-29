@@ -33,8 +33,10 @@ Defaults (override with env vars):
                     network/shared volume, where FSEvents/inotify never fire for
                     another machine's writes (default: 1; set 0 for local-only)
   SOLVER_POLL_INTERVAL  seconds between polls (default: 1.0)
-  SOLVER_SETTLE     secs a loose image must be idle before reading, for the
-                    one-shot single-image mode only          (default: 1.0)
+  SOLVER_SETTLE     secs each page (or a one-shot image) must be present and
+                    size-stable before it's read — the "settle for multiple
+                    pages" that matters on a mounted/network volume where page
+                    bytes can lag the manifest                (default: 1.0)
 
 Auth: ANTHROPIC_API_KEY in the environment, or an `ant auth login` profile —
 the SDK resolves either. No key in code.
@@ -114,9 +116,12 @@ SYSTEM = (
 
 
 def wait_until_settled(path: Path, idle: float, timeout: float = 30.0) -> bool:
-    """Block until path's size stops changing for `idle` seconds. Used for the
-    one-shot single-image mode (a batch's pages are already complete when its
-    manifest appears, so the watcher path doesn't need this)."""
+    """Block until `path` exists and its size stops changing for `idle` seconds.
+
+    Waits for the file to APPEAR too (doesn't bail if it's not there yet): across
+    a mounted/network volume the manifest can show up before the page bytes have
+    finished propagating, so each page may still be absent or growing when we
+    first look. Returns False if it never settles within `timeout`."""
     deadline = time.monotonic() + timeout
     last = -1
     stable_since = None
@@ -124,7 +129,10 @@ def wait_until_settled(path: Path, idle: float, timeout: float = 30.0) -> bool:
         try:
             size = path.stat().st_size
         except FileNotFoundError:
-            return False
+            stable_since = None  # not synced across the mount yet — keep waiting
+            last = -1
+            time.sleep(0.2)
+            continue
         if size > 0 and size == last:
             if stable_since is None:
                 stable_since = time.monotonic()
@@ -238,7 +246,22 @@ def solve_batch(manifest_path: Path, client: anthropic.Anthropic) -> None:
     pages = manifest.get("pages") or sorted(
         p.name for p in batch_dir.glob("page-*.png")
     )
-    blocks = [b for b in (image_block(batch_dir / name) for name in pages) if b]
+    # Wait for every listed page to appear and finish writing before reading it.
+    # On a mounted/network volume the manifest can arrive ahead of the page
+    # bytes, so a page may still be missing or growing right after detection.
+    ready = []
+    for name in pages:
+        p = batch_dir / name
+        if wait_until_settled(p, SETTLE):
+            ready.append(p)
+        else:
+            print(f"  ! {batch_dir.name}/{name}: never settled, skipping page",
+                  file=sys.stderr, flush=True)
+    if len(ready) < len(pages):
+        print(f"  ! {batch_dir.name}: {len(ready)}/{len(pages)} pages ready",
+              file=sys.stderr, flush=True)
+
+    blocks = [b for b in (image_block(p) for p in ready) if b]
     if not blocks:
         print(f"  ! {batch_dir.name}: no readable pages, skipping", file=sys.stderr, flush=True)
         return
