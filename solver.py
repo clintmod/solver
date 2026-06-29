@@ -29,6 +29,10 @@ Defaults (override with env vars):
                     present at startup
   SOLVER_THINKING   stream reasoning too    (default: 0)
   SOLVER_NOTIFY     macOS notification      (default: 1)
+  SOLVER_POLL       poll instead of native FS events — REQUIRED for a mounted/
+                    network/shared volume, where FSEvents/inotify never fire for
+                    another machine's writes (default: 1; set 0 for local-only)
+  SOLVER_POLL_INTERVAL  seconds between polls (default: 1.0)
   SOLVER_SETTLE     secs a loose image must be idle before reading, for the
                     one-shot single-image mode only          (default: 1.0)
 
@@ -50,6 +54,7 @@ from typing import Optional
 import anthropic
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
+from watchdog.observers.polling import PollingObserver
 
 WATCH_DIR = Path(
     os.environ.get("SOLVER_DIR") or os.environ.get("SHOT_DIR") or "~/Screenshots"
@@ -60,6 +65,11 @@ SETTLE = float(os.environ.get("SOLVER_SETTLE", "1.0"))
 BACKLOG = os.environ.get("SOLVER_BACKLOG", "0") == "1"
 SHOW_THINKING = os.environ.get("SOLVER_THINKING", "0") == "1"
 NOTIFY = os.environ.get("SOLVER_NOTIFY", "1") == "1"
+# Native FS events (FSEvents/inotify) do NOT fire for files written by another
+# machine on a mounted/network/shared volume. Poll by default so the watcher
+# works across mounts; set SOLVER_POLL=0 for lower CPU on a purely-local folder.
+POLL = os.environ.get("SOLVER_POLL", "1") != "0"
+POLL_INTERVAL = float(os.environ.get("SOLVER_POLL_INTERVAL", "1.0"))
 
 MANIFEST = "manifest.json"
 SOLVED_MARKER = ".solved"
@@ -369,13 +379,15 @@ def main() -> None:
             if not (m.parent / SOLVED_MARKER).exists():
                 work.put(m)
 
-    observer = Observer()
+    observer = PollingObserver(timeout=POLL_INTERVAL) if POLL else Observer()
     observer.schedule(Handler(work), str(WATCH_DIR), recursive=True)
     observer.start()
 
+    watch_mode = f"polling every {POLL_INTERVAL}s" if POLL else "native FS events"
     print(
         f"Watching {WATCH_DIR} for new batches\n"
         f"  model:   {MODEL}\n"
+        f"  watch:   {watch_mode}\n"
         f"  backlog: {'yes' if BACKLOG else 'no (new batches only)'}\n"
         "Press Ctrl-C to stop.",
         flush=True,
